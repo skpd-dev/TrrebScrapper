@@ -97,9 +97,7 @@ async def scrape_trreb_search_page(
             paginated_url = build_paginated_url(
                 base_search_url, search_params, skip
             )
-            print(
-                f"🔍 Fetching page results offset (skip={skip}): {paginated_url}"
-            )
+            print(f"🔍 Scanning search results (skip={skip})...")
 
             response = await client.get(paginated_url)
             soup = bs4.BeautifulSoup(response.text, "html.parser")
