@@ -1,4 +1,5 @@
 import requests
+import time 
 from config import OTP_URL, TODAY_DATE
 
 # Persistent session to reuse TCP connections across calls
@@ -8,6 +9,7 @@ session.headers.update({"User-Agent": "OTP-Transit-Script/1.0 (Contact: local-de
 
 def geocode_address(address: str) -> tuple[float | None, float | None]:
     """Geocodes an address via OpenStreetMap Nominatim API with structured logging."""
+    time.sleep(1.1)
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": address, "format": "json", "limit": 1}
 

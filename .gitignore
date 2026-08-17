@@ -220,4 +220,5 @@ __marimo__/
 
 # Flat files
 *.csv
-
+*.xlsx
+*.xls
