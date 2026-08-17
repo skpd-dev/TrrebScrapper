@@ -1,148 +1,287 @@
-# TRREB Rental Data Pipeline
+# TRREB Rental & Transit Intelligence Pipeline
 
-An incremental Python data pipeline that collects publicly available Toronto rental listings, tracks listing lifecycle changes, geocodes properties, and enriches them with public-transit accessibility data using OpenTripPlanner.
+An incremental Python data engineering pipeline that collects publicly available Toronto rental listings and enriches each property with **multimodal public-transit accessibility data using OpenTripPlanner and GraphQL**.
 
-## What it does
+The project combines web ingestion, address normalization, geospatial processing, transit routing, itinerary analysis, and historical listing lifecycle tracking.
 
-```text
-TRREB Search
-     │
-     ▼
-Listing Discovery
-     │
-     ├── New ──────► Extract + Enrich
-     │
-     ├── Existing ─► Keep Live
-     │
-     └── Missing ──► Move to Lost
-                         │
-                         ▼
-                  Historical Record
-```
-
-The pipeline maintains two datasets:
-
-* **Live** — listings currently appearing in the configured TRREB search
-* **Lost** — listings previously observed but no longer appearing in the search
-
-This makes the dataset incremental and preserves listing lifecycle history instead of simply deleting disappeared records.
-
-## Key Features
-
-* Async HTTP ingestion with `asyncio` + `httpx`
-* Bounded concurrency for listing requests
-* Pagination and URL-based deduplication
-* Incremental new/listing detection
-* Live → Lost lifecycle tracking
-* Address normalization and unit/floor extraction
-* Geocoding with OpenStreetMap Nominatim
-* Transit routing through OpenTripPlanner GraphQL
-* Transit optimization by:
-
-  * Minimum transfers
-  * Shortest duration
-* Approximate transit headway/frequency calculation
-* Excel output with `Live` and `Lost` sheets
-* CSV export for downstream analytics
-
-## Architecture
+## What It Does
 
 ```text
                  TRREB
                    │
                    ▼
-            Async Ingestion
+          Rental Listing Discovery
                    │
                    ▼
           Address Normalization
                    │
-             ┌─────┴─────┐
-             ▼           ▼
-         Geocoding    State Check
-             │           │
-             ▼           ▼
-      OpenTripPlanner  Live/Lost
-             │
-             ▼
-       Transit Metrics
-             │
-             ▼
-        Excel / CSV
+                   ▼
+              Geocoding
+                   │
+                   ▼
+        Latitude / Longitude
+                   │
+                   ▼
+        OpenTripPlanner GraphQL
+                   │
+                   ▼
+          Transit Itineraries
+                   │
+          ┌────────┴────────┐
+          ▼                 ▼
+   Min Transfers      Shortest Time
+          │                 │
+          └────────┬────────┘
+                   ▼
+          Transit Analytics
+                   │
+                   ▼
+             Live / Lost
+              Dataset
 ```
 
-## Repository Structure
+---
+
+## Transit Intelligence
+
+The main purpose of the enrichment layer is to answer:
+
+> **"Given this rental property's location, how accessible is my target destination by public transit?"**
+
+Instead of simply calculating straight-line distance or attaching a transit link, the pipeline queries a locally hosted **OpenTripPlanner** instance through its GraphQL API and analyzes the returned itineraries.
+
+For each property, the system can extract:
+
+* Total travel duration
+* Departure time
+* Arrival time
+* Number of transfers
+* Transit modes
+* Transit routes
+* Route short names
+* Route long names
+* Approximate route frequency/headway
+
+### Routing Flow
 
 ```text
-├── main.py       # Pipeline orchestration and lifecycle management
-├── scraper.py    # TRREB pagination and listing extraction
-├── transit.py    # Geocoding and OpenTripPlanner enrichment
-├── utils.py      # Address normalization and data cleaning
-├── config.py     # Search parameters and service configuration
-└── README.md
+Rental Address
+      │
+      ▼
+Nominatim Geocoder
+      │
+      ▼
+Latitude / Longitude
+      │
+      ▼
+OpenTripPlanner
+      │
+      ▼
+GraphQL Itinerary Query
+      │
+      ▼
+Multiple Candidate Routes
+      │
+      ├──────────────┐
+      ▼              ▼
+Transfer Analysis   Duration Analysis
+      │              │
+      ▼              ▼
+Minimum Transfers   Shortest Duration
+      │              │
+      └───────┬──────┘
+              ▼
+       Property Metrics
 ```
 
-## Listing Lifecycle
+The routing layer requests multiple itinerary alternatives rather than assuming that the first returned route is automatically the best option.
 
-Each execution compares the current TRREB search snapshot with the previous `Live` dataset.
+---
 
-```python
-new  = current_urls - previous_live_urls
-lost = previous_live_urls - current_urls
-```
+## Two Transit Optimization Strategies
 
-Listings that disappear are moved to `Lost` rather than permanently deleted.
+Transit "best" is subjective, so the pipeline preserves two different optimization strategies.
 
-If a previously lost listing appears again, it can return to `Live`.
+### 1. Minimum Transfers
 
-This provides a lightweight historical state model:
+Prioritizes:
 
 ```text
-NEW → LIVE → LOST
-          ↑
-          └── REAPPEARED
+Number of transfers
+        ↓
+Travel duration
 ```
 
-## Data Enrichment
+This answers:
 
-Each new listing is normalized and geocoded before being sent to OpenTripPlanner.
+> **What is the fastest itinerary among the options requiring the fewest transfers?**
+
+Useful for commuters who prioritize simplicity and reliability over absolute travel time.
 
 Example:
 
 ```text
-4 Wild Rose Gdns Upper
-          │
-          ▼
-4 Wild Rose Gardens
-          │
-          ▼
-Latitude / Longitude
-          │
-          ▼
-Transit itineraries
+42 minutes
+0 transfers
 ```
 
-The pipeline separates unit/floor annotations from the physical address to improve geocoding reliability.
+may be preferable to:
 
-Transit enrichment produces metrics including:
+```text
+31 minutes
+2 transfers
+```
 
-* Total duration
-* Number of transfers
-* Transit routes
-* Approximate route frequency
+### 2. Shortest Duration
 
-Two optimization strategies are retained:
+Prioritizes:
 
-**Minimum transfers**
+```text
+Travel duration
+        ↓
+Number of transfers
+```
 
-> Fastest itinerary among options with the fewest transfers.
+This answers:
 
-**Shortest duration**
+> **What is the fastest available itinerary?**
 
-> Fastest available itinerary regardless of transfer count.
+Example:
+
+```text
+31 minutes
+2 transfers
+```
+
+The pipeline therefore preserves both perspectives instead of reducing transit accessibility to a single number.
+
+---
+
+## Transit Frequency / Headway
+
+The pipeline also derives an approximate transit frequency from departure times returned by OpenTripPlanner.
+
+For example:
+
+```text
+08:00
+08:12
+08:24
+08:36
+```
+
+produces an approximate:
+
+```text
+12 minute headway
+```
+
+This gives the rental dataset another useful dimension beyond journey time:
+
+```text
+Property
+   │
+   ├── Travel Time
+   ├── Transfers
+   ├── Routes
+   └── Approximate Frequency
+```
+
+This is an analytical estimate based on the returned itinerary data, not an official transit-frequency guarantee.
+
+---
+
+## Listing Lifecycle
+
+The pipeline also maintains an incremental view of the rental market.
+
+Each run compares the current TRREB search snapshot with the previous `Live` dataset.
+
+```python
+new = current_urls - previous_live_urls
+lost = previous_live_urls - current_urls
+```
+
+Listings are classified as:
+
+```text
+NEW → LIVE → LOST
+          ↑
+          │
+      REAPPEARED
+```
+
+### `Live`
+
+Listings currently appearing in the configured search.
+
+### `Lost`
+
+Listings previously observed but no longer appearing in the current search.
+
+A listing being `Lost` does **not** automatically mean it was rented. It may have expired, changed status, been removed, or stopped matching the configured search criteria.
+
+Historical `Lost` records are retained rather than deleted.
+
+---
+
+## Async Data Ingestion
+
+Listing pages are I/O-bound, so the scraper uses:
+
+* `asyncio`
+* `httpx.AsyncClient`
+* `asyncio.gather`
+* bounded concurrency with `asyncio.Semaphore`
+
+This allows multiple listing requests to be processed concurrently while preventing an unrestricted number of simultaneous requests.
+
+Only newly discovered listings need detailed extraction and transit enrichment, reducing unnecessary downstream API work.
+
+---
+
+## Address Normalization
+
+Real-estate listing addresses often contain unit and floor information that can interfere with geocoding.
+
+Examples:
+
+```text
+4 Wild Rose Gdns Upper
+123 Main St 2F
+55 King St Main Floor
+100 Queen St (2nd bedroom)
+```
+
+The pipeline separates the physical address from listing-specific annotations:
+
+```text
+Raw:
+4 Wild Rose Gdns Upper
+
+Address:
+4 Wild Rose Gardens
+
+Unit_Details:
+Gdns Upper
+```
+
+This normalized address is then used for geocoding.
+
+Fallback geocoding strategies can handle variations such as:
+
+```text
+Gdns ↔ Gardens
+St ↔ Street
+Ave ↔ Avenue
+Cres ↔ Crescent
+```
+
+---
 
 ## Output
 
-The pipeline generates:
+The primary output is:
 
 ```text
 trreb_listings.xlsx
@@ -150,50 +289,125 @@ trreb_listings.xlsx
 
 ### Live
 
-Current listings matching the configured search.
+Current rental listings with their property and transit information.
 
 ### Lost
 
 Previously observed listings that are no longer present in the current search.
 
-It also exports the current live dataset to CSV for downstream processing.
+The pipeline also exports the current live dataset as CSV for downstream analysis.
 
-## Technology
+---
 
-* Python
-* asyncio
-* httpx
-* BeautifulSoup
-* Pandas
-* OpenPyXL
-* OpenStreetMap Nominatim
-* OpenTripPlanner
-* GraphQL
+## Repository Structure
+
+```text
+TrrebScrapper/
+│
+├── main.py
+│   └── Pipeline orchestration,
+│       lifecycle tracking and output
+│
+├── scraper.py
+│   └── TRREB pagination,
+│       URL discovery and listing extraction
+│
+├── transit.py
+│   └── Geocoding + OpenTripPlanner
+│       GraphQL transit enrichment
+│
+├── utils.py
+│   └── Address normalization
+│       and data cleaning
+│
+├── config.py
+│   └── Search and service configuration
+│
+└── README.md
+```
+
+---
+
+## Technology Stack
+
+| Technology                | Purpose                    |
+| ------------------------- | -------------------------- |
+| Python                    | Pipeline implementation    |
+| asyncio                   | Concurrent I/O             |
+| httpx                     | Async HTTP ingestion       |
+| BeautifulSoup             | HTML parsing               |
+| Pandas                    | Data transformation        |
+| OpenPyXL                  | Excel output               |
+| Nominatim / OpenStreetMap | Geocoding                  |
+| OpenTripPlanner           | Multimodal transit routing |
+| GraphQL                   | Transit data interface     |
+| Excel / CSV               | Data persistence           |
+
+---
 
 ## Responsible Data Collection
 
-The project works with information exposed through publicly accessible listing pages and does not attempt to bypass authentication, CAPTCHAs, access controls, or other technical protections.
+The ingestion layer works with information exposed through publicly accessible listing pages.
 
-Request concurrency is bounded and incremental processing avoids repeatedly requesting listings that have already been processed.
+It does not attempt to bypass:
 
-Automated access policies and website terms can change, so users should review the applicable terms and restrictions before operating the pipeline.
+* Authentication
+* CAPTCHAs
+* Access controls
+* Technical protections
 
-## Why I Built It
+The scraper uses incremental processing, connection reuse, and bounded concurrency to avoid unnecessarily repeating requests.
 
-This project started as a rental-listing scraper but evolved into an end-to-end data engineering workflow involving:
+No automated system can guarantee that a website will never rate-limit or block requests. Users should review applicable website terms and access policies before operating the pipeline.
 
-**ingestion → incremental processing → data quality → geospatial enrichment → API integration → historical state → analytics.**
+---
 
-It demonstrates how semi-structured external data can be transformed into a structured, continuously maintained analytical dataset.
+## Why This Project?
+
+The project evolved beyond a traditional web scraper into an end-to-end data engineering pipeline:
+
+```text
+Public Web Data
+      ↓
+Async Ingestion
+      ↓
+Incremental State
+      ↓
+Data Normalization
+      ↓
+Geospatial Enrichment
+      ↓
+GraphQL API Integration
+      ↓
+Transit Routing
+      ↓
+Itinerary Optimization
+      ↓
+Historical Analytics
+```
+
+The result is a property-level dataset that combines **rental-market information with real-world transit accessibility**.
+
+This creates opportunities for analysis such as:
+
+* Rental price vs. commute time
+* Rental price vs. transit accessibility
+* Transfer complexity by neighborhood
+* Transit frequency vs. rental price
+* Listing lifetime by neighborhood
+* Best rental locations for a specific destination
+
+---
 
 ## Future Improvements
 
+* Historical rental-price tracking
 * PostgreSQL / Parquet storage
 * Automated scheduling
 * Retry and exponential backoff
-* Data-quality tests
 * Structured logging and monitoring
-* Historical price tracking
+* Transit accessibility scoring
+* Historical commute-time analysis
 * Dockerized OpenTripPlanner
-* Power BI analytics
-* Listing lifetime and rental-market analysis
+* Power BI dashboard
+* Automated data-quality testing
